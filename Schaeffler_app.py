@@ -203,7 +203,7 @@ def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
         """
         
         respuesta = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.5-flash',
             contents=[archivo_subido, prompt]
         )
         
