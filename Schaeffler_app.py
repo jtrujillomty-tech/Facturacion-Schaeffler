@@ -6,6 +6,8 @@ from io import BytesIO
 from google import genai
 import tempfile
 import os
+import json
+import time
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Gestor FBAP - Schaeffler", page_icon="⚙️", layout="wide")
@@ -161,8 +163,24 @@ def procesar_logica_it(df_it, df_routing, df_rate):
 # ==========================================
 # MOTOR 2: PROCESAMIENTO DESDE PDF CON GEMINI
 # ==========================================
+def llamar_gemini_con_reintentos(archivo_subido, prompt, max_intentos=3):
+    """Función aislada para manejar los reintentos sin congelar Streamlit."""
+    for intento in range(max_intentos):
+        try:
+            # Volvemos a tu modelo 3.5-flash-lite que funcionaba bien
+            respuesta = client.models.generate_content(
+                model='gemini-3.5-flash-lite',
+                contents=[archivo_subido, prompt]
+            )
+            return respuesta
+        except Exception as e:
+            if "503" in str(e) and intento < max_intentos - 1:
+                time.sleep(3) # Espera más corta
+                continue
+            raise e # Lanza el error si no es 503 o si se acabaron los intentos
+
 def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
-    # Guardamos el archivo temporalmente para que Gemini detecte la extensión .pdf
+    # Guardamos el archivo temporalmente
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(archivo_pdf_bytes)
         ruta_temporal = tmp.name
@@ -199,40 +217,28 @@ def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
         2. Si no hay factura ni montos, deja los numéricos en 0 y textos en "".
         """
         
-        max_reintentos = 3
-        for intento in range(max_reintentos):
-            try:
-                respuesta = client.models.generate_content(
-                    model='gemini-3.5-flash-lite',
-                    contents=[archivo_subido, prompt]
-                )
-                break
-            except Exception as e:
-                error_str = str(e)
-                if "503" in error_str and intento < max_reintentos - 1:
-                    import time
-                    time.sleep(5)
-                else:
-                    raise e
+        # Usamos la nueva función aislada
+        respuesta = llamar_gemini_con_reintentos(archivo_subido, prompt)
         
-        import json
         texto_json = respuesta.text.replace('```json', '').replace('```', '').strip()
         datos = json.loads(texto_json)
         
+        # Limpieza exitosa
         try:
             client.files.delete(name=archivo_subido.name)
             os.remove(ruta_temporal)
-        except Exception:
+        except:
             pass
             
         return datos
         
     except Exception as e:
+        # Limpieza en caso de fallo crítico
         try:
             if 'archivo_subido' in locals():
                 client.files.delete(name=archivo_subido.name)
             os.remove(ruta_temporal)
-        except Exception:
+        except:
             pass
         raise e
 
@@ -355,7 +361,7 @@ with pestana_pdf:
             if client is None:
                 st.error("⚠️ La API Key de Google Gemini no está configurada en los Secrets de Streamlit.")
             else:
-                with st.spinner("Analizando documento con Inteligencia Artificial..."):
+                with st.spinner("Analizando documento con Inteligencia Artificial (puede tardar unos segundos)..."):
                     try:
                         bytes_pdf = archivo_pdf.read()
                         datos_json = extraer_datos_con_gemini(bytes_pdf, archivo_pdf.name)
