@@ -202,10 +202,23 @@ def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
         3. Asegúrate de extraer la ciudad origen y destino lo más exactas posibles.
         """
         
-        respuesta = client.models.generate_content(
-            model='gemini-3.5-flash',
-            contents=[archivo_subido, prompt]
-        )
+        max_reintentos = 3
+        for intento in range(max_reintentos):
+            try:
+                respuesta = client.models.generate_content(
+                    model='gemini-3.5-flash-lite',
+                    contents=[archivo_subido, prompt]
+                )
+                break # Si tiene éxito, rompe el ciclo y continúa
+            except Exception as e:
+                error_str = str(e)
+                if "503" in error_str and intento < max_reintentos - 1:
+                    # Si es error 503 y aún nos quedan intentos, esperamos 5 segundos
+                    import time
+                    time.sleep(5)
+                else:
+                    # Si no es 503, o ya nos gastamos los 3 intentos, lanza el error
+                    raise e
         
         texto_json = respuesta.text.replace('```json', '').replace('```', '').strip()
         datos = json.loads(texto_json)
