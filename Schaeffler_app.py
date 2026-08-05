@@ -4,6 +4,8 @@ import numpy as np
 import re
 from io import BytesIO
 from google import genai
+import tempfile
+import os
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Gestor FBAP - Schaeffler", page_icon="⚙️", layout="wide")
@@ -161,58 +163,71 @@ def procesar_logica_it(df_it, df_routing, df_rate):
 # MOTOR 2: PROCESAMIENTO DESDE PDF CON GEMINI
 # ==========================================
 def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
-    # Subimos el archivo temporalmente usando la API de Gemini
-    archivo_temp = BytesIO(archivo_pdf_bytes)
-    archivo_temp.name = nombre_archivo
-    
-    archivo_subido = client.files.upload(file=archivo_temp)
-    
-    prompt = """
-    Actúa como un extractor de datos aduanales. Analiza TODO el documento (incluso si no tiene pedimento o factura de aduana formal, busca los Inward Cargo Manifest) y devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta, sin texto adicional:
-    {
-      "invoice_no": "",
-      "invoice_date": "",
-      "total_factura": 0.00,
-      "us_custom_broker": 0.00,
-      "invoice_comment": "",
-      "referencia": "",
-      "pedimento": "",
-      "entries": [
-        {
-          "numero_entry": "NFP12345678",
-          "consignee": "Nombre exacto del consignatario o dueño en el manifiesto",
-          "container": "Contenedor o casilla 8",
-          "referencia": "Referencia si la hay",
-          "pedimento": "Pedimento si lo hay",
-          "ciudad_origen": "Ciudad de origen del shipper",
-          "ciudad_destino": "Ciudad de destino",
-          "medio_transporte": "Ground",
-          "operacion": "IMP/EXP"
-        }
-      ]
-    }
-    ⚠️ INSTRUCCIONES:
-    1. Extrae TODOS los números de Entry (que empiezan con NFP) de los manifiestos de carga.
-    2. Si no hay factura ni montos, deja los campos numéricos en 0 y textos vacíos "".
-    3. Asegúrate de extraer la ciudad origen y destino lo más exactas posibles.
-    """
-    
+    # 1. Guardamos el archivo temporalmente en el servidor de Streamlit para que Gemini detecte el .pdf
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(archivo_pdf_bytes)
+        ruta_temporal = tmp.name
+        
     try:
+        # 2. Subimos el archivo usando la ruta temporal
+        archivo_subido = client.files.upload(file=ruta_temporal)
+        
+        prompt = """
+        Actúa como un extractor de datos aduanales. Analiza TODO el documento (incluso si no tiene pedimento o factura de aduana formal, busca los Inward Cargo Manifest) y devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta, sin texto adicional:
+        {
+          "invoice_no": "",
+          "invoice_date": "",
+          "total_factura": 0.00,
+          "us_custom_broker": 0.00,
+          "invoice_comment": "",
+          "referencia": "",
+          "pedimento": "",
+          "entries": [
+            {
+              "numero_entry": "NFP12345678",
+              "consignee": "Nombre exacto del consignatario o dueño en el manifiesto",
+              "container": "Contenedor o casilla 8",
+              "referencia": "Referencia si la hay",
+              "pedimento": "Pedimento si lo hay",
+              "ciudad_origen": "Ciudad de origen del shipper",
+              "ciudad_destino": "Ciudad de destino",
+              "medio_transporte": "Ground",
+              "operacion": "IMP/EXP"
+            }
+          ]
+        }
+        ⚠️ INSTRUCCIONES:
+        1. Extrae TODOS los números de Entry (que empiezan con NFP) de los manifiestos de carga.
+        2. Si no hay factura ni montos, deja los campos numéricos en 0 y textos vacíos "".
+        3. Asegúrate de extraer la ciudad origen y destino lo más exactas posibles.
+        """
+        
         respuesta = client.models.generate_content(
-            model='gemini-2.5-flash', # Actualizado al modelo estándar eficiente
+            model='gemini-2.5-flash',
             contents=[archivo_subido, prompt]
         )
+        
         texto_json = respuesta.text.replace('```json', '').replace('```', '').strip()
         datos = json.loads(texto_json)
-        client.files.delete(name=archivo_subido.name)
-        return datos
-    except Exception as e:
+        
+        # 3. Limpieza: Borramos de Gemini y del servidor local
         try:
             client.files.delete(name=archivo_subido.name)
-        except:
+            os.remove(ruta_temporal)
+        except Exception:
             pass
-        return None
-
+            
+        return datos
+        
+    except Exception as e:
+        # Limpieza en caso de error
+        try:
+            if 'archivo_subido' in locals():
+                client.files.delete(name=archivo_subido.name)
+            os.remove(ruta_temporal)
+        except Exception:
+            pass
+        raise e # Lanza el error para que Streamlit lo muestre y sepamos qué falló
 def procesar_logica_pdf(datos_json, df_routing, df_rate):
     filas_reporte = []
     cobro_broker = float(datos_json.get('us_custom_broker', 0))
