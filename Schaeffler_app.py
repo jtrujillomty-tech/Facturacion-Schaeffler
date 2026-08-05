@@ -12,7 +12,7 @@ import time
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Gestor FBAP - Schaeffler", page_icon="⚙️", layout="wide")
 
-# Inicializar cliente de Gemini usando los Secrets seguros de Streamlit Cloud
+# Inicializar cliente de Gemini usando los Secrets
 try:
     API_KEY = st.secrets["GOOGLE_API_KEY"]
     client = genai.Client(api_key=API_KEY)
@@ -34,12 +34,24 @@ def asignar_fbap(consignee):
 def procesar_logica_it(df_it, df_routing, df_rate):
     df_it['Invoice_No'] = df_it['Invoice_No'].fillna('PENDIENTE')
     
+    # --- AJUSTE: Búsqueda dinámica de la columna del Broker ---
+    broker_col = 'TOTAL_US CUSTOM BROKER'
+    if 'TOTAL_US Import declaration' in df_it.columns:
+        broker_col = 'TOTAL_US Import declaration'
+    elif 'TOTAL_US CUSTOM BROKER' not in df_it.columns:
+        for col in df_it.columns:
+            if 'Import declaration' in col or 'BROKER' in col:
+                broker_col = col
+                break
+    if broker_col not in df_it.columns:
+        df_it[broker_col] = 0.0 # Columna de respaldo por si no existe ninguna
+    
     agg_funcs = {
         'Reference_No': 'first', 'PEDIMENTO': 'first', 'Impo_Expo': 'first',
         'Container_No': 'first', 'Tipo_envio': 'first', 'Tipo_Caja': 'first',             
         'Proveedor': 'first', 'DIRECCION_FACTURA': 'first', 'DIRECCION_FPEDIMENTO': 'first',
         'Bill_to_party_Mexico': 'first', 'Invoice_Creation_Date': 'first',
-        'TOTAL_Americana': 'first', 'TOTAL_US CUSTOM BROKER': 'first'
+        'TOTAL_Americana': 'first', broker_col: 'first'
     }
     
     entradas_unicas = df_it.groupby(['Invoice_No', 'EntryNumber'], as_index=False).agg(agg_funcs)
@@ -49,18 +61,24 @@ def procesar_logica_it(df_it, df_routing, df_rate):
     for factura in facturas:
         df_factura = entradas_unicas[entradas_unicas['Invoice_No'] == factura]
         es_facturado = (factura != 'PENDIENTE')
-        cantidad_entries = len(df_factura)
+        
+        # --- AJUSTE: Contar SOLO los que empiezan con NFP ---
+        es_nfp_series = df_factura['EntryNumber'].astype(str).str.startswith('NFP')
+        cantidad_entries_nfp = es_nfp_series.sum()
         
         if es_facturado:
-            cobro_broker = float(df_factura.iloc[0]['TOTAL_US CUSTOM BROKER']) if pd.notnull(df_factura.iloc[0]['TOTAL_US CUSTOM BROKER']) else 0.0
+            cobro_broker = float(df_factura.iloc[0][broker_col]) if pd.notnull(df_factura.iloc[0][broker_col]) else 0.0
             total_factura = float(df_factura.iloc[0]['TOTAL_Americana']) if pd.notnull(df_factura.iloc[0]['TOTAL_Americana']) else 0.0
-            esperado = cantidad_entries * 63.00
+            esperado = cantidad_entries_nfp * 63.00
             cuadra = abs(cobro_broker - esperado) < 0.01 and cobro_broker > 0
+            restante = total_factura - cobro_broker
         else:
-            cobro_broker = total_factura = esperado = 0.0
+            cobro_broker = total_factura = esperado = restante = 0.0
             cuadra = False
-        
+            
+        remanente_asignado = False
         filas_factura_actual = []
+        
         for i, row in df_factura.iterrows():
             origen_bruto = str(row['DIRECCION_FPEDIMENTO']).upper()
             destino_bruto = str(row['DIRECCION_FACTURA']).upper()
@@ -84,7 +102,7 @@ def procesar_logica_it(df_it, df_routing, df_rate):
                 lane_id = filtro_lane.iloc[0]['Lane ID']
                 delivery_location = str(filtro_lane.iloc[0].get('Receiver Location', destino_busqueda))
             else:
-                lane_id = f"No existe Lane: {origen_busqueda} - {destino_busqueda}"
+                lane_id = f"Lane not found: {origen_busqueda} - {destino_busqueda}"
                 delivery_location = destino_busqueda
             
             operacion_bruta = str(row['Impo_Expo']).upper()
@@ -103,7 +121,7 @@ def procesar_logica_it(df_it, df_routing, df_rate):
                 (df_rate['Equipment'] == equipo_rate) 
             ]
             
-            rate_id = filtro_rate.iloc[0]['Rate ID'] if not filtro_rate.empty else f"No existe rate para: {operacion_buscar} / {tipo_envio} / {equipo_rate}"
+            rate_id = filtro_rate.iloc[0]['Rate ID'] if not filtro_rate.empty else f"Rate not found: {operacion_buscar} / {tipo_envio} / {equipo_rate}"
             rate_card_id = f"{lane_id} // {rate_id}"
             
             ref_val = str(row['Reference_No']).strip()
@@ -113,9 +131,24 @@ def procesar_logica_it(df_it, df_routing, df_rate):
             if ref_val and ref_val != 'NAN' and ped_val and ped_val != 'NAN': reference_no = f"{ref_val} // {ped_val}"
             elif ped_val and ped_val != 'NAN': reference_no = ped_val
             else: reference_no = ref_val if ref_val != 'NAN' else ''
-                
+            
+            # --- AJUSTE: Asignación Inteligente de Montos (NFP vs Otros) ---
+            is_nfp = str(row['EntryNumber']).startswith('NFP')
+            
             if es_facturado:
-                monto_asignado = 63.00 if cuadra else total_factura
+                if cuadra:
+                    if is_nfp:
+                        monto_asignado = 63.00
+                    else:
+                        # Si no es NFP, le inyectamos el remanente (Otros gastos)
+                        if not remanente_asignado and restante > 0.01:
+                            monto_asignado = round(restante, 2)
+                            remanente_asignado = True
+                        else:
+                            monto_asignado = '' # Si ya se asignó, lo dejamos en blanco
+                else:
+                    monto_asignado = total_factura
+                    
                 fecha_creacion = row['Invoice_Creation_Date']
                 if pd.notnull(fecha_creacion):
                     fecha_creacion = pd.to_datetime(fecha_creacion).strftime('%m/%d/%Y')
@@ -149,9 +182,9 @@ def procesar_logica_it(df_it, df_routing, df_rate):
             }
             filas_factura_actual.append(fila)
             
-        if es_facturado and cuadra:
-            restante = total_factura - cobro_broker
-            if restante > 0.01 and len(filas_factura_actual) > 0:
+        # --- AJUSTE: Si cuadró, hay remanente y NO hubo una fila de "Otros", creamos la fila extra ---
+        if es_facturado and cuadra and restante > 0.01 and not remanente_asignado:
+            if len(filas_factura_actual) > 0:
                 fila_extra = filas_factura_actual[0].copy()
                 fila_extra['Invoice_Amount_Subtotal_MXN'] = round(restante, 2)
                 filas_factura_actual.append(fila_extra)
@@ -164,10 +197,8 @@ def procesar_logica_it(df_it, df_routing, df_rate):
 # MOTOR 2: PROCESAMIENTO DESDE PDF CON GEMINI
 # ==========================================
 def llamar_gemini_con_reintentos(archivo_subido, prompt, max_intentos=3):
-    """Función aislada para manejar los reintentos sin congelar Streamlit."""
     for intento in range(max_intentos):
         try:
-            # Volvemos a tu modelo 3.5-flash-lite que funcionaba bien
             respuesta = client.models.generate_content(
                 model='gemini-3.5-flash-lite',
                 contents=[archivo_subido, prompt]
@@ -175,12 +206,11 @@ def llamar_gemini_con_reintentos(archivo_subido, prompt, max_intentos=3):
             return respuesta
         except Exception as e:
             if "503" in str(e) and intento < max_intentos - 1:
-                time.sleep(3) # Espera más corta
+                time.sleep(3) 
                 continue
-            raise e # Lanza el error si no es 503 o si se acabaron los intentos
+            raise e 
 
 def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
-    # Guardamos el archivo temporalmente
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(archivo_pdf_bytes)
         ruta_temporal = tmp.name
@@ -217,13 +247,11 @@ def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
         2. Si no hay factura ni montos, deja los numéricos en 0 y textos en "".
         """
         
-        # Usamos la nueva función aislada
         respuesta = llamar_gemini_con_reintentos(archivo_subido, prompt)
         
         texto_json = respuesta.text.replace('```json', '').replace('```', '').strip()
         datos = json.loads(texto_json)
         
-        # Limpieza exitosa
         try:
             client.files.delete(name=archivo_subido.name)
             os.remove(ruta_temporal)
@@ -233,7 +261,6 @@ def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
         return datos
         
     except Exception as e:
-        # Limpieza en caso de fallo crítico
         try:
             if 'archivo_subido' in locals():
                 client.files.delete(name=archivo_subido.name)
@@ -244,12 +271,6 @@ def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
 
 def procesar_logica_pdf(datos_json, df_routing, df_rate):
     filas_reporte = []
-    cobro_broker = float(datos_json.get('us_custom_broker', 0))
-    total_factura = float(datos_json.get('total_factura', 0))
-    cantidad_entries = len(datos_json.get('entries', []))
-    
-    esperado = cantidad_entries * 63.00
-    cuadra = abs(cobro_broker - esperado) < 0.01 and cobro_broker > 0
     
     for entry in datos_json.get('entries', []):
         origen_bruto = str(entry.get('ciudad_origen', '')).upper()
@@ -273,7 +294,7 @@ def procesar_logica_pdf(datos_json, df_routing, df_rate):
             lane_id = filtro_lane.iloc[0]['Lane ID']
             delivery_location = str(filtro_lane.iloc[0].get('Receiver Location', destino_busqueda))
         else:
-            lane_id = f"No existe Lane: {origen_busqueda} - {destino_busqueda}"
+            lane_id = f"Lane not found: {origen_busqueda} - {destino_busqueda}"
             delivery_location = destino_busqueda
 
         operacion_bruta = str(entry.get('operacion', 'IMP')).upper()
@@ -284,23 +305,28 @@ def procesar_logica_pdf(datos_json, df_routing, df_rate):
             df_rate['Export / Import'].str.contains(operacion_buscar, case=False, na=False) &
             df_rate['Type'].str.contains("direct", case=False, na=False)
         ]
-        rate_id = filtro_rate.iloc[0]['Rate ID'] if not filtro_rate.empty else "No existe rate"
+        rate_id = filtro_rate.iloc[0]['Rate ID'] if not filtro_rate.empty else "Rate not found"
         rate_card_id = f"{lane_id} // {rate_id}"
         
         ref_val = str(entry.get('referencia') or datos_json.get('referencia', '')).strip()
         ped_val = str(entry.get('pedimento') or datos_json.get('pedimento', '')).strip().replace(' ', '')
         if ped_val.endswith('.0'): ped_val = ped_val[:-2]
         
-        if ref_val and ref_val != 'NAN' and ped_val and ped_val != 'NAN': reference_no = f"{ref_val} // {ped_val}"
-        elif ped_val and ped_val != 'NAN': reference_no = ped_val
-        else: reference_no = ref_val if ref_val != 'NAN' else ''
+        numero_entry_limpio = str(entry.get('numero_entry', '')).replace('-', '')
+        
+        # --- AJUSTE: Si no hay pedimento, usa el NFP como Referencia ---
+        if not ped_val or ped_val == 'NAN':
+            reference_no = numero_entry_limpio
+        else:
+            if ref_val and ref_val != 'NAN' and ped_val and ped_val != 'NAN': reference_no = f"{ref_val} // {ped_val}"
+            elif ped_val and ped_val != 'NAN': reference_no = ped_val
+            else: reference_no = ref_val if ref_val != 'NAN' else ''
 
-        monto_asignado = 63.00 if cuadra else (total_factura if total_factura > 0 else '')
         consignee_val = entry.get('consignee', '')
         
         fila = {
             'FBAP_Tab': asignar_fbap(consignee_val),
-            'Numero de Entry': str(entry.get('numero_entry', '')).replace('-', ''),
+            'Numero de Entry': numero_entry_limpio,
             'Reference_No': reference_no,
             'Container_No': entry.get('container', ''),
             'Contracted Rate Card ID': rate_card_id,
@@ -309,10 +335,11 @@ def procesar_logica_pdf(datos_json, df_routing, df_rate):
             'Transport_Medium': 'Ground',
             'Import_Export_Domestic': operacion_reporte,
             'Bill_to_party_Mexico': str(consignee_val).upper(),
-            'Invoice_No': datos_json.get('invoice_no', ''),
-            'Invoice_Creation_Date': datos_json.get('invoice_date', ''),
+            # --- AJUSTE: Campos forzados en blanco para Pre-Facturación ---
+            'Invoice_No': '', 
+            'Invoice_Creation_Date': '', 
             'X': '', 'X2': '', 'X3': '',
-            'Invoice_Amount_Subtotal_MXN': monto_asignado
+            'Invoice_Amount_Subtotal_MXN': ''
         }
         filas_reporte.append(fila)
         
