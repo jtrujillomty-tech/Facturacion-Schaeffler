@@ -11,7 +11,6 @@ import os
 st.set_page_config(page_title="Gestor FBAP - Schaeffler", page_icon="⚙️", layout="wide")
 
 # Inicializar cliente de Gemini usando los Secrets seguros de Streamlit Cloud
-# (Asegúrate de configurar GOOGLE_API_KEY en el panel de Secrets de tu app en Streamlit)
 try:
     API_KEY = st.secrets["GOOGLE_API_KEY"]
     client = genai.Client(api_key=API_KEY)
@@ -163,13 +162,12 @@ def procesar_logica_it(df_it, df_routing, df_rate):
 # MOTOR 2: PROCESAMIENTO DESDE PDF CON GEMINI
 # ==========================================
 def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
-    # 1. Guardamos el archivo temporalmente en el servidor de Streamlit para que Gemini detecte el .pdf
+    # Guardamos el archivo temporalmente para que Gemini detecte la extensión .pdf
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(archivo_pdf_bytes)
         ruta_temporal = tmp.name
         
     try:
-        # 2. Subimos el archivo usando la ruta temporal
         archivo_subido = client.files.upload(file=ruta_temporal)
         
         prompt = """
@@ -197,9 +195,8 @@ def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
           ]
         }
         ⚠️ INSTRUCCIONES:
-        1. Extrae TODOS los números de Entry (que empiezan con NFP) de los manifiestos de carga.
-        2. Si no hay factura ni montos, deja los campos numéricos en 0 y textos vacíos "".
-        3. Asegúrate de extraer la ciudad origen y destino lo más exactas posibles.
+        1. Extrae TODOS los números de Entry (que empiezan con NFP).
+        2. Si no hay factura ni montos, deja los numéricos en 0 y textos en "".
         """
         
         max_reintentos = 3
@@ -209,21 +206,19 @@ def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
                     model='gemini-3.5-flash-lite',
                     contents=[archivo_subido, prompt]
                 )
-                break # Si tiene éxito, rompe el ciclo y continúa
+                break
             except Exception as e:
                 error_str = str(e)
                 if "503" in error_str and intento < max_reintentos - 1:
-                    # Si es error 503 y aún nos quedan intentos, esperamos 5 segundos
                     import time
                     time.sleep(5)
                 else:
-                    # Si no es 503, o ya nos gastamos los 3 intentos, lanza el error
                     raise e
         
+        import json
         texto_json = respuesta.text.replace('```json', '').replace('```', '').strip()
         datos = json.loads(texto_json)
         
-        # 3. Limpieza: Borramos de Gemini y del servidor local
         try:
             client.files.delete(name=archivo_subido.name)
             os.remove(ruta_temporal)
@@ -233,14 +228,14 @@ def extraer_datos_con_gemini(archivo_pdf_bytes, nombre_archivo):
         return datos
         
     except Exception as e:
-        # Limpieza en caso de error
         try:
             if 'archivo_subido' in locals():
                 client.files.delete(name=archivo_subido.name)
             os.remove(ruta_temporal)
         except Exception:
             pass
-        raise e # Lanza el error para que Streamlit lo muestre y sepamos qué falló
+        raise e
+
 def procesar_logica_pdf(datos_json, df_routing, df_rate):
     filas_reporte = []
     cobro_broker = float(datos_json.get('us_custom_broker', 0))
@@ -249,7 +244,6 @@ def procesar_logica_pdf(datos_json, df_routing, df_rate):
     
     esperado = cantidad_entries * 63.00
     cuadra = abs(cobro_broker - esperado) < 0.01 and cobro_broker > 0
-    comentario_factura = datos_json.get('invoice_comment', '')
     
     for entry in datos_json.get('entries', []):
         origen_bruto = str(entry.get('ciudad_origen', '')).upper()
@@ -323,15 +317,13 @@ def procesar_logica_pdf(datos_json, df_routing, df_rate):
 # ==========================================
 st.title("⚙️ Generador Automático FBAP - Schaeffler")
 
-# Creamos dos pestañas para separar ambos métodos
-pestana_it, pestana_pdf = st.tabs(["📊 Opción 1: Reporte Excel de IT (Post/Pre-Factura)", "📄 Opción 2: Lector de PDF con IA (Sin Pedimento)"])
+pestana_it, pestana_pdf = st.tabs(["📊 Opción 1: Reporte Excel de IT", "📄 Opción 2: Lector de PDF (Sin Pedimento)"])
 
-# CARGA DE BASES ESTÁTICAS DE RESPALDO
 try:
     df_routing = pd.read_excel("2023-02-01 Routing Guide.xlsx", sheet_name=0, header=1)
     df_rate = pd.read_excel("2022-11-08 Rate Card.xlsx", sheet_name=0, header=1)
 except Exception as e:
-    st.error(f"⚠️ Faltan los archivos estáticos en el repositorio de GitHub (Routing Guide o Rate Card): {e}")
+    st.error(f"⚠️ Faltan los archivos estáticos (Routing Guide o Rate Card): {e}")
     st.stop()
 
 with pestana_it:
